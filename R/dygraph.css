@@ -1,0 +1,7 @@
+
+.dygraph-legend > span { display: none; }
+.dygraph-legend > span.highlight { display: inline; }
+
+#.highlight {
+#    background-color: #B0B0B0; /* grey background*/
+#}

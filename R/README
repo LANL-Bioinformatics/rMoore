@@ -1,0 +1,3 @@
+Changes were made to convert the original code to an R Shiny app. 
+
+To run the app, you can use RStudio (https://www.rstudio.com/), or use R Shiny Server (https://www.rstudio.com/products/shiny/download-server/) to run the app in a web browser.
