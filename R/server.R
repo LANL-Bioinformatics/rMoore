@@ -2,18 +2,11 @@ library(shiny)
 library(DT)
 library(dygraphs)
 library(xts)
+library(readr)
+library(dplyr)
+library(europepmc)
 
-getData<-function(acc_num, limit) {
-  library(readr)
-  library(dplyr)
-  library(europepmc)
-  
-  url1  <- "ftp://ftp.ncbi.nih.gov/genomes/GENOME_REPORTS/prokaryotes.txt"
-  
-  x <- read_delim(url1, delim = "\t", na = "-", quote = "")
-  
-  #replace  #Organism/Name in column 1
-  names(x)[1] <- "Organism"
+getData<-function(acc_num, limit, x) {
   
   #21.6K with genome publication
   
@@ -22,10 +15,7 @@ getData<-function(acc_num, limit) {
   #The replicon field isn’t great, but you can use grep to find matches
   #  SEARCH for accession in Replicon
   
-  # y <- filter( x, grepl( "NC_003143",  Replicons) )
-  
   y <- filter( x, grepl( acc_num,  Replicons) )
-  
   
   ## Run queries using Ropensci’s package
   
@@ -33,45 +23,83 @@ getData<-function(acc_num, limit) {
   
   ## full names Or abbreviations?
   names(res) <- c("Genome paper", "Cites genome paper", "Mentions genome accessions",  "Matches keywords")
+  
+  # This order is important - this will make the genome papers be sorted to the top of the results because they're associated
+  # with name '*'
   names(res) <- c("*", "G", "A", "K")
   
+  # Added - if there're multiple PubMed IDs for the given accession, need to search for results from each
+  
+  # Examples that can be used for testing:
+  # NC_002163 has 2 PubMed IDs 
+  # NC_003902 has 1 PubMedID
+  # NC_036211 has no Europe PMC results
+  
+  PubMedIDs <- unlist(strsplit(y$`Pubmed ID`,","))
+  
+  #Return an empty tibble if there aren't any PubMedIDs for the accession. This avoids the code throwing
+  # errors later in the function if there aren't any PubMedIDs for the accession.
+  if(is.null(PubMedIDs)){
+    return(tibble)
+  }
   
   #1. Get Genome publication
-  
-  q1 <- paste0( "EXT_ID:", y$`Pubmed ID` )
- 
-  
-  res[[1]] <- epmc_search( q1, limit = limit)
-  
-  
+
+  # Modified to get the genome publications for each pubmedID that's linked to the query accession
+  getGenomePublication <- function(pubmedID, limit){
+
+    q1 <- paste0( "EXT_ID:", pubmedID )
+
+    # Modified
+    result <- epmc_search( q1, limit = limit, synonym = FALSE)
+    
+    return(result)
+  }
+
+  # This lapply call normally returns one tibble for each pubmed ID. Bind rows groups them into a single tibble (with columns
+  # intellegently expanded if different pubmed IDs return different column names or different entries)
+  res[[1]] <- bind_rows(lapply(X = PubMedIDs, FUN = getGenomePublication, limit))
+
   #  100 is default limit in epmc_search  (change if needed)
   res$citedByCount
   
-  
   #2. Cites Genome publication
   
-  q2 <- paste0( "cites:", y$`Pubmed ID`, "_MED")
-  
-  res[[2]] <- epmc_search( q2, limit = limit)
-  
-  
+  # Modified to get the publications citing the genome publication for each pubmedID that's linked to the query accession
+  getCitationsOfGenomePublication <- function(pubmedID, limit){
+
+    q2 <- paste0( "cites:", pubmedID, "_MED")
+
+    result <- epmc_search( q2, limit = limit, synonym = FALSE)
+    
+    return(result)
+  }
+
+  # This lapply call normally returns one tibble for each pubmed ID. Bind rows groups them into a single tibble (with columns
+  # intellegently expanded if different pubmed IDs return different column names or different entries)
+  res[[2]] <- bind_rows(lapply(X = PubMedIDs, FUN = getCitationsOfGenomePublication, limit))
+
   #3. Mentions genome accession in Full text...
   
   # create a function to parse replicon field and add WGS or bioproject acc (rarely cited).
   ## add SRC:MED to return publications with Pubmed ID
   
-  y$Replicons
+  # Modified - commented out
+  # y$Replicons
  
   format_acc <- function(y){
+    
+    #Original
     ids <- gsub(".*chromosome:([^.]+).*/([^.]+).*", "\\1 OR \\2", y$Replicons)
     if(!is.na( y$WGS))   ids <- paste0(ids, " OR ", substr(y$WGS, 1,5), "*")
-    paste0( "(", ids, ") AND SRC:MED")
+    return(paste0( "(", ids, ") AND SRC:MED"))
+    
   }
   
   q3 <- format_acc(y)
- 
-  res[[3]] <- epmc_search( q3, limit = limit)
   
+  # Modified
+  res[[3]] <- epmc_search( q3, limit = limit, synonym = FALSE)
   
   # 4   Keywords
   
@@ -81,12 +109,29 @@ getData<-function(acc_num, limit) {
   
   q4 <-    paste( y$Organism, "genome AND SRC:MED")        
   #[1] "Algoriphagus machipongonensis genome AND SRC:MED"
-  res[[4]] <- epmc_search(q4, limit = limit)
   
+  # Modified
+  res[[4]] <- epmc_search(q4, limit = limit, synonym = FALSE)
+
   # COMBINE
   y <- bind_rows(res, .id = "Evidence")
-  z <- group_by_(y,  .dots=setdiff(names(y), "Evidence")) %>% summarize( Evidence = paste(Evidence, collapse=", "))
   
+  # Original
+  # z <- group_by_(y,  .dots=setdiff(names(y), "Evidence")) %>% summarize( Evidence = paste(sort(Evidence), collapse=", "))
+  
+  # Modified
+  z_beforeSort <- group_by_(y,  .dots=setdiff(names(y), "Evidence")) %>% summarize( Evidence = paste(sort(Evidence), collapse=", "))
+  
+  # Sort the entries in z so that any that are genome papers (have '*' in the evidence column) are listed first in the results. This is not the case
+  # by default (without sorting) if there is more than one entry in the evidence column and one entry is '*'. Example evidence entry: "*, A"
+
+  # First get the first entry in the evidence column ('*' entries for genome papers should always be listed as the first entry in this column
+  # regardless of how many other entries there may be in the evidence column due to the ordering of the names of the res list)
+  firstEvidence <- unlist(lapply(strsplit(z_beforeSort$Evidence, ", "), function(x){return(x[1])}))
+  
+  # Now sort z based on that order
+  z <- z_beforeSort[order(firstEvidence),]
+
   ## again, abbreviations might be easier...
   table(z$Evidence)
   authors_etal(z$authorString)
@@ -94,46 +139,121 @@ getData<-function(acc_num, limit) {
   return (z)
   
 }
+
+# Added; this prevents downloading the genome report for each listed accession if the user enters more than one
+downloadGenomeReport <- function(){
+  
+  url1  <- "ftp://ftp.ncbi.nih.gov/genomes/GENOME_REPORTS/prokaryotes.txt"
+
+  # Modified to read in multiple PubMedIDs for each accession correctly
+  x <- read_delim(url1, delim = "\t", na = "-", quote = "",col_types = cols(
+    .default = col_character(),
+    TaxID = col_integer(),
+    `BioProject ID` = col_integer(),
+    `Size (Mb)` = col_double(),
+    `GC%` = col_double(),
+    Scaffolds = col_integer(),
+    Genes = col_integer(),
+    Proteins = col_integer(),
+    `Release Date` = col_date(format = ""),
+    `Modify Date` = col_date(format = ""),
+    `Pubmed ID` = col_character()
+  ))
+
+  #replace  #Organism/Name in column 1
+  names(x)[1] <- "Organism"
+  
+  return(x)
+}
+
 shinyServer(function(input, output) {
+  # When the input is updated, try getting the data.
   x <- eventReactive( input$update, {
+    # Provides the progress bar
     withProgress({     
       setProgress(message = "Searching Europe PMC...")
       # CHECK query
       req(input$acc_num)
       query <- input$acc_num
-      #n <- input$obs
+      
+      # This is the limit for the number of returned search results
       n=100
+      
+      # Not currently used because the limit to the search results is hard-coded.
       if(n > 2500) n <- 2500
+      
       x <- new.env(hash=T, parent=emptyenv())
-      ids<-strsplit(query, "\\s+")[[1]]
+      
+      # Modified to allow any whitespace (space, tab, others) as well as commas to delimit multiple entries. These all work the same:
+      # NC_002163,NC_036211
+      # NC_002163 NC_036211
+      # NC_002163, NC_036211
+      # NC_002163   ,   NC_036211
+      ids <- strsplit(query, "[[:blank:]]*[\\s,]+[[:blank:]]*")[[1]]
+      
+      # Added. Download the genome report
+      genomeReport <- downloadGenomeReport()
+      
+      # This is used to keep track of the number of results returned from searching the user-entered accession(s)
+      # and returning an error message if no results were found for any accession(s)
+      nrowHolder <- numeric()
+      
       for(i in ids) {
-        #cat(file=stderr(), i,"test\n")
-        y = getData(i,n)
-        assign(i,y,x)
+        # i is accession number, n is the limit to the number of output records listed
+        y = getData(i,n, genomeReport)
+        
+        # the nrow(y) is NULL (and doesn't add any entries to the nrowHolder) if there aren't any results returned for
+        # a given accession.
+        nrowHolder <- c(nrow(y), nrowHolder)
+        
+        # Only assign the results to the environment 'x' (using the name of the accession number ('i')) when there
+        # were results returned. Without this filtering, an error occurs when using DT::renderDataTable below.
+        if(!is.null(nrow(y))){
+          assign(i,y,x)
+        }
       }
-      #x = getData(query,n)
+      
+      # Check if there are records rows in the nrowHolder; if so then at least 1 of the accessions being searched returned results, so show
+      # those. If not, return an message that no results were found. Note that this is not an error message, just a message that gets displayed on
+      # the RShiny ui.
+        validate(
+          need(length(nrowHolder) > 0, ifelse(length(ids) > 1, "No results found for those accessions.", "No results found for that accession."))
+        )
+
       x
     })
   })
   
   # Filter data based on selections
   output$table <-DT::renderDataTable({
+    
+    # This reads in all objects in the environment x (created above)
     df <-x()
+
+    #browser()()
     i <- 0
+    # loop through objects in the environment x
     for(y in ls(df)) {
       #cat(file=stderr(), y,"got\n")
+      
       if(i == 0) {
+        
         df1 <- df[[y]]
+        #browser()()
       } else {
         df1 <- bind_rows(df1,df[[y]])
       }
       i <- i+1
     }
+    # This escapes characters from the html links to make them more secure.
     DT::datatable(DT_format(df1), escape = c(1,5) )
+
   })
+  
   
   output$plot <- renderDygraph({
     df <-x()
+    
     i <- 0
     for(y in ls(df)) {
       #cat(file=stderr(), y,"got\n")
@@ -164,7 +284,6 @@ shinyServer(function(input, output) {
       dyCSS( "dygraph.css")
    
   })
-  
 })
 
 
@@ -216,6 +335,7 @@ DT_format <- function(x, authors=3, issue=FALSE, links=TRUE ){
     
   }
   x <- data.frame(pmid, authors, year, title, journal, citedBy)
+  #browser()()
   x
 }
 
